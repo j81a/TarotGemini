@@ -4,11 +4,25 @@ plugins {
     alias(libs.plugins.kotlin.compose)
 }
 
+// Cargar GEMINI_API_KEY desde local.properties o variable de entorno (no hardcodear secretos)
+val geminiApiKey: String = run {
+    val localFile = rootProject.file("local.properties")
+    if (localFile.exists()) {
+        localFile.readLines()
+            .map { it.trim() }
+            .firstOrNull { it.startsWith("GEMINI_API_KEY=") }
+            ?.substringAfter("=")
+            ?: System.getenv("GEMINI_API_KEY")
+            ?: ""
+    } else {
+        System.getenv("GEMINI_API_KEY") ?: ""
+    }
+}
+
 android {
     namespace = "com.waveapp.tarotgemini"
-    compileSdk {
-        version = release(36)
-    }
+    // compileSdk debe ser un entero en Kotlin DSL
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.waveapp.tarotgemini"
@@ -18,6 +32,9 @@ android {
         versionName = "1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        // Exponer la API key como BuildConfig.GEMINI_API_KEY (valor vacío si no está definida localmente)
+        buildConfigField("String", "GEMINI_API_KEY", "\"$geminiApiKey\"")
     }
 
     buildTypes {
@@ -33,11 +50,17 @@ android {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
     }
-    kotlinOptions {
-        jvmTarget = "11"
-    }
+    // quitar kotlinOptions de aquí; lo configuramos usando tasks.withType más abajo
     buildFeatures {
         compose = true
+        buildConfig = true
+    }
+}
+
+// Configurar kotlinOptions (jvmTarget) de forma segura
+tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>().configureEach {
+    kotlinOptions {
+        jvmTarget = "11"
     }
 }
 
@@ -60,4 +83,10 @@ dependencies {
 
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.6")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.6")
+
+    // Gemini AI SDK
+    implementation("com.google.ai.client.generativeai:generativeai:0.1.2")
+
+    // Coroutines para operaciones asíncronas
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
 }
