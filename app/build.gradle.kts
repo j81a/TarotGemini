@@ -84,8 +84,11 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.6")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.6")
 
-    // Gemini AI SDK
-    implementation("com.google.ai.client.generativeai:generativeai:0.1.2")
+    // SDK oficial de Generative AI (cliente de Google) - versión sugerida
+    implementation("com.google.ai.client.generativeai:generativeai:0.9.0")
+
+    // OkHttp (fallback para llamadas HTTP manuales si es necesario)
+    implementation("com.squareup.okhttp3:okhttp:4.11.0")
 
     // Coroutines para operaciones asíncronas
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")

@@ -1,5 +1,6 @@
 package com.waveapp.tarotgemini.ui.viewmodel
 
+import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.waveapp.tarotgemini.data.model.DrawnCard
@@ -101,6 +102,8 @@ class TarotViewModel(
                     }
                 },
                 onFailure = { exception ->
+                    // Loguear completo antes de exponer al UI
+                    Log.e("ERROR_INTERPRETACION", "Error al obtener interpretación: ${exception.message}", exception)
                     _uiState.update {
                         it.copy(
                             error = "Error al obtener interpretación: ${exception.message}",
@@ -132,6 +135,7 @@ class TarotViewModel(
                     }
                 },
                 onFailure = { exception ->
+                    Log.e("ERROR_INTERPRETACION", "Error al obtener significado: ${exception.message}", exception)
                     _uiState.update {
                         it.copy(
                             error = "Error al obtener significado: ${exception.message}",
@@ -192,4 +196,3 @@ data class TarotUiState(
     val isButtonEnabled: Boolean
         get() = question.isNotBlank() && !isLoading
 }
-
