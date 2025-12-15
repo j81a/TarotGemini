@@ -5,7 +5,6 @@ import com.waveapp.tarotgemini.data.model.DrawnCard
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeout
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -42,8 +41,7 @@ class GeminiClient {
     // Modelo a usar: usar el que exista en la cuenta (según tu curl, gemini-2.5-flash está disponible)
     private val modelName = "models/gemini-2.5-flash"
 
-    // Timeout y reintentos
-    private val requestTimeoutMs = 30_000L
+    // Reintentos
     private val maxRetries = 2
 
     suspend fun interpretSpread(question: String, drawnCards: List<DrawnCard>): Result<String> {
@@ -140,17 +138,19 @@ class GeminiClient {
     private fun tryCallSdk(prompt: String): Result<String> {
         // Construir payload básico para la REST API por si necesitamos usarlo en el fallback
         val restBody = JSONObject().apply {
-            put("prompt", JSONObject().apply {
-                put("messages", listOf(JSONObject().apply {
-                    put("author", "user")
-                    put("content", listOf(JSONObject().apply {
-                        put("type", "text")
-                        put("text", prompt)
-                    }))
-                }))
+            put("contents", org.json.JSONArray().apply {
+                put(JSONObject().apply {
+                    put("parts", org.json.JSONArray().apply {
+                        put(JSONObject().apply {
+                            put("text", prompt)
+                        })
+                    })
+                })
             })
-            put("temperature", 0.7)
-            put("max_output_tokens", 512)
+            put("generationConfig", JSONObject().apply {
+                put("temperature", 0.7)
+                put("maxOutputTokens", 512)
+            })
         }.toString()
 
         // Log request
@@ -189,24 +189,19 @@ class GeminiClient {
     private fun callRestGenerate(prompt: String): Result<String> {
         // Construir el JSON según la especificación REST para generateContent/generate
         val requestJson = JSONObject().apply {
-            // NEW: usar "input" / "instructions" bajo la versión v1? Usaremos la forma recomendada por la API de Generative Language
-            // Basado en la respuesta del servidor, el endpoint espera 'prompt' con 'messages' OR puede aceptar 'input' dependiendo de la versión.
-            // Usaremos la forma que tus curls hicieron con modelos:generateContent en v1: enviar 'prompt' con messages.
-            put("prompt", JSONObject().apply {
-                put("messages", org.json.JSONArray().apply {
-                    put(JSONObject().apply {
-                        put("author", "user")
-                        put("content", org.json.JSONArray().apply {
-                            put(JSONObject().apply {
-                                put("type", "text")
-                                put("text", prompt)
-                            })
+            put("contents", org.json.JSONArray().apply {
+                put(JSONObject().apply {
+                    put("parts", org.json.JSONArray().apply {
+                        put(JSONObject().apply {
+                            put("text", prompt)
                         })
                     })
                 })
             })
-            put("temperature", 0.7)
-            put("maxOutputTokens", 512)
+            put("generationConfig", JSONObject().apply {
+                put("temperature", 0.7)
+                put("maxOutputTokens", 512)
+            })
         }.toString()
 
         // Log request body completo
@@ -231,28 +226,57 @@ class GeminiClient {
                 // Extraer texto de la respuesta JSON según la forma esperada
                 try {
                     val j = JSONObject(bodyText)
-                    // La estructura puede variar; intentaremos extraer campos comunes
+                    // La estructura puede variar; intentaremos extraer texto de varias formas comunes
+                    // 1) candidates -> [0] -> content -> parts -> [0] -> text
                     if (j.has("candidates")) {
                         val candidates = j.getJSONArray("candidates")
                         if (candidates.length() > 0) {
-                            val text = candidates.getJSONObject(0).optString("output")
-                            if (text.isNotBlank()) return Result.success(text)
+                            val candidate = candidates.getJSONObject(0)
+                            // Extraer text flexible desde 'content' (puede ser JSONObject/JSONArray/string)
+                            val contentObj = candidate.opt("content")
+                            val extracted = extractTextFromContent(contentObj)
+                            if (extracted.isNotBlank()) {
+                                // Log de texto extraído (por seguridad truncamos a 1000 chars en log)
+                                val preview = if (extracted.length > 1000) extracted.substring(0, 1000) + "..." else extracted
+                                Log.d("ERROR_INTERPRETACION", "Extracted text length=${extracted.length}. Preview: $preview")
+                                // Si la generación fue truncada por tokens, avisar
+                                val finishReason = candidate.optString("finishReason", candidate.optString("finish_reason", ""))
+                                if (finishReason.equals("MAX_TOKENS", ignoreCase = true)) {
+                                    Log.w("ERROR_INTERPRETACION", "Response truncated (finishReason=MAX_TOKENS). Consider increasing maxOutputTokens if needed.")
+                                }
+                                return Result.success(extracted)
+                            }
+                            // fallback: candidate might have 'output' field
+                            val out = candidate.optString("output", "")
+                            if (out.isNotBlank()) return Result.success(out)
                         }
                     }
 
-                    // Alternativa: "output" o "content" u otros
-                    if (j.has("output")) {
-                        return Result.success(j.optString("output"))
+                    // 2) outputs -> [0] -> content -> parts -> [0] -> text
+                    if (j.has("outputs")) {
+                        val outputs = j.getJSONArray("outputs")
+                        if (outputs.length() > 0) {
+                            val outObj = outputs.getJSONObject(0)
+                            val contentObj = outObj.opt("content")
+                            val extracted = extractTextFromContent(contentObj)
+                            if (extracted.isNotBlank()) {
+                                val preview = if (extracted.length > 1000) extracted.substring(0, 1000) + "..." else extracted
+                                Log.d("ERROR_INTERPRETACION", "Extracted text from outputs length=${extracted.length}. Preview: $preview")
+                                val finishReason = outObj.optString("finishReason", outObj.optString("finish_reason", ""))
+                                if (finishReason.equals("MAX_TOKENS", ignoreCase = true)) {
+                                    Log.w("ERROR_INTERPRETACION", "Outputs truncated (finishReason=MAX_TOKENS).")
+                                }
+                                return Result.success(extracted)
+                            }
+                        }
                     }
 
-                    // Otra posible estructura: "content" -> [{"text":"..."}]
+                    // 3) top-level fields
+                    if (j.has("output")) return Result.success(j.optString("output"))
                     if (j.has("content")) {
-                        val contentArr = j.getJSONArray("content")
-                        if (contentArr.length() > 0) {
-                            val first = contentArr.getJSONObject(0)
-                            val txt = first.optString("text", first.optString("output", ""))
-                            if (txt.isNotBlank()) return Result.success(txt)
-                        }
+                        val contentObj = j.opt("content")
+                        val extracted = extractTextFromContent(contentObj)
+                        if (extracted.isNotBlank()) return Result.success(extracted)
                     }
 
                     // Si no encontramos, devolver el JSON completo como fallback
@@ -268,22 +292,64 @@ class GeminiClient {
         }
     }
 
+    // Extrae texto de un objeto 'content' flexible que puede ser JSONObject, JSONArray o String
+    private fun extractTextFromContent(contentObj: Any?): String {
+        try {
+            if (contentObj == null) return ""
+            // JSONArray
+            if (contentObj is org.json.JSONArray) {
+                val sb = StringBuilder()
+                for (i in 0 until contentObj.length()) {
+                    val item = contentObj.get(i)
+                    val partText = extractTextFromContent(item)
+                    if (partText.isNotBlank()) {
+                        if (sb.isNotEmpty()) sb.append("\n")
+                        sb.append(partText)
+                    }
+                }
+                return sb.toString()
+            }
+
+            // JSONObject
+            if (contentObj is org.json.JSONObject) {
+                // caso común: content -> { "parts": [ { "text": "..." } ], "role": "model" }
+                if (contentObj.has("parts")) {
+                    val parts = contentObj.getJSONArray("parts")
+                    val sb = StringBuilder()
+                    for (i in 0 until parts.length()) {
+                        val p = parts.getJSONObject(i)
+                        val t = p.optString("text", p.optString("output", "")).trim()
+                        if (t.isNotBlank()) {
+                            if (sb.isNotEmpty()) sb.append("\n")
+                            sb.append(t)
+                        }
+                    }
+                    if (sb.isNotEmpty()) return sb.toString()
+                }
+
+                // content may directly have 'text' or 'output'
+                val direct = contentObj.optString("text", contentObj.optString("output", "")).trim()
+                if (direct.isNotBlank()) return direct
+
+                // fallback: return whole JSON string
+                return contentObj.toString()
+            }
+
+            // String or other
+            return contentObj.toString()
+        } catch (t: Throwable) {
+            Log.w("ERROR_INTERPRETACION", "extractTextFromContent failed: ${t.message}")
+            return ""
+        }
+    }
+
     // Generador local para fallback cuando la API no está disponible o falla
     private fun generateFakeResponse(prompt: String): String {
-        // Intentamos construir una interpretación sencilla a partir del prompt: extraer nombres de cartas si aparecen
-        val cardNames = Regex("Carta: ([\\p{L}0-9_\\- ]+)").findAll(prompt).map { it.groupValues[1].trim() }.toList()
-        val sb = StringBuilder()
-        if (cardNames.isNotEmpty()) {
-            sb.appendLine("Interpretación (simulada):")
-            sb.appendLine()
-            sb.appendLine("Resumen de las cartas: ${cardNames.joinToString(", ")}")
-            sb.appendLine()
-            sb.appendLine("En general, estas cartas sugieren una mezcla de introspección y acción. Observa las posiciones y cómo se relacionan entre sí: algunas cartas apuntan a desafíos, otras a oportunidades.")
-            sb.appendLine()
-            sb.appendLine("Consejo: toma tiempo para reflexionar, comunica tus inquietudes con claridad y actúa con intención.")
-        } else {
-            sb.appendLine("Interpretación (simulada): Las cartas indican que se aproxima un periodo de cambio. Mantén la mente abierta y actúa con honestidad.")
+        return buildString {
+            appendLine("Interpretación simulada (fallback local):")
+            appendLine("Consulta: $prompt")
+            appendLine("Respuesta: Las cartas indican un camino de autodescubrimiento y crecimiento personal.")
+            appendLine("Consejo: Confía en tu intuición y busca el equilibrio emocional.")
         }
-        return sb.toString()
     }
 }
