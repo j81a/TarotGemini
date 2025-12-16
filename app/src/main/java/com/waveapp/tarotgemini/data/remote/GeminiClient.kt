@@ -48,10 +48,10 @@ class GeminiClient {
     suspend fun interpretSpread(question: String, drawnCards: List<DrawnCard>): Result<String> {
         if (apiKey.isBlank()) {
             // Fallback local para desarrollo: generar interpretación simulada
-            return Result.success(generateFakeResponse(buildPrompt(question, drawnCards)) + "\n\n[Nota: GEMINI_API_KEY no configurada]")
+            return Result.success(generateFakeResponse(buildPromptCompact(question, drawnCards)) + "\n\n[Nota: GEMINI_API_KEY no configurada]")
         }
 
-        val prompt = buildPrompt(question, drawnCards)
+        val prompt = buildPromptCompact(question, drawnCards)
 
         return callWithRetries(prompt)
     }
@@ -106,15 +106,40 @@ class GeminiClient {
         return@withContext Result.success(finalFallback)
     }
 
-    private fun buildPrompt(question: String, drawnCards: List<DrawnCard>): String {
-        // Prompt minimalista en una sola línea para ahorrar tokens
-        val compactCards = drawnCards.mapIndexed { index, dc ->
-            val orient = if (dc.isReversed) "(Inv)" else "(Up)"
-            "${index + 1})${dc.card.name}$orient"
-        }.joinToString(";")
-        return "PREGUNTA: $question | CARTAS: $compactCards | RESPONDE: una sola línea, sin razonamiento ni metadatos, máximo 600 caracteres."
-    }
+//    private fun buildPrompt(question: String, drawnCards: List<DrawnCard>): String {
+//        // Prompt minimalista en una sola línea para ahorrar tokens
+//        val compactCards = drawnCards.mapIndexed { index, dc ->
+//            val orient = if (dc.isReversed) "(Inv)" else "(Up)"
+//            "${index + 1})${dc.card.name}$orient"
+//        }.joinToString(";")
+//        return "PREGUNTA: $question | CARTAS: $compactCards | RESPONDE: una sola línea, sin razonamiento ni metadatos, máximo 600 caracteres."
+//    }
 
+    private fun buildPromptCompact(question: String, drawnCards: List<DrawnCard>): String {
+        val cardsSummary = drawnCards.mapIndexed { i, dc ->
+            "${i+1})${dc.card.name}(${if(dc.isReversed) "Inv" else "Up"})"
+        }.joinToString(";")
+
+        return """
+        Como tarotista humano, convierte esta tirada en una mini-historia:
+        
+        PREGUNTA: "$question"
+        CARTAS: $cardsSummary
+        
+        **INSTRUCCIONES:**
+        1. No nombres cartas ni digas "significa"
+        2. Cartas Up=pasado/manifiesto ("Ocurrió..."), Inv=potencial/internal ("Había...")
+        3. Conecta como causa-efecto natural
+        4. Un párrafo fluido, tono empático, enfoque humano
+        5. ${if(question.contains("pasado", ignoreCase = true)) "Usa tiempo pasado" else "Usa tiempo apropiado"}
+        
+        **EJEMPLO DE ESTRUCTURA:**
+        "Al inicio [experiencia carta 1], lo cual llevó a [proceso carta 2], 
+        y al final [resultado carta 3]. La lección fue..."
+        
+        **RESPONDE AHORA:**
+    """.trimIndent()
+    }
 
     // Intentar llamar a la SDK oficial por reflexión para evitar dependencias estáticas en tiempo de compilación
     private fun tryCallSdk(prompt: String): Result<String> {
@@ -130,8 +155,9 @@ class GeminiClient {
                 })
             })
             put("generationConfig", JSONObject().apply {
-                put("temperature", 0.7)
-                put("maxOutputTokens", 512)
+                put("temperature", 0.85)
+                put("topP", 0.95)
+                put("maxOutputTokens", 2048)
             })
         }.toString()
 
