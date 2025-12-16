@@ -12,6 +12,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import java.io.IOException
 import java.util.concurrent.TimeUnit
+import kotlin.random.Random
 
 /**
  * Cliente que llama a la API de Generative Language (Gemini) de Google.
@@ -106,33 +107,14 @@ class GeminiClient {
     }
 
     private fun buildPrompt(question: String, drawnCards: List<DrawnCard>): String {
-        return buildString {
-            appendLine("Eres un experto tarotista con años de experiencia en lectura de cartas.")
-            appendLine("Tu objetivo es proporcionar interpretaciones profundas, místicas y significativas.")
-            appendLine()
-            appendLine("PREGUNTA DEL CONSULTANTE:")
-            appendLine("\"$question\"")
-            appendLine()
-            appendLine("CARTAS DE LA TIRADA:")
-            drawnCards.forEachIndexed { index, drawnCard ->
-                appendLine()
-                appendLine("Posición ${index + 1}: ${drawnCard.positionMeaning}")
-                appendLine("Carta: ${drawnCard.card.name}")
-                appendLine("Orientación: ${if (drawnCard.isReversed) "Invertida" else "Normal"}")
-                val meaning = if (drawnCard.isReversed) drawnCard.card.reversedMeaning else drawnCard.card.uprightMeaning
-                appendLine("Significado: $meaning")
-            }
-            appendLine()
-            appendLine("Por favor, proporciona:")
-            appendLine("1. Una interpretación general de la tirada completa")
-            appendLine("2. Cómo las cartas se relacionan entre sí")
-            appendLine("3. Un mensaje final o consejo para el consultante")
-            appendLine()
-            appendLine("Usa un tono místico pero accesible, comprensivo y esperanzador.")
-            appendLine()
-            appendLine("IMPORTANTE: No repitas el prompt ni las instrucciones. Devuelve únicamente la interpretación en texto plano, sin encabezados técnicos ni el prompt. Limítate a la interpretación completa en lenguaje natural.")
-        }
+        // Prompt minimalista en una sola línea para ahorrar tokens
+        val compactCards = drawnCards.mapIndexed { index, dc ->
+            val orient = if (dc.isReversed) "(Inv)" else "(Up)"
+            "${index + 1})${dc.card.name}$orient"
+        }.joinToString(";")
+        return "PREGUNTA: $question | CARTAS: $compactCards | RESPONDE: una sola línea, sin razonamiento ni metadatos, máximo 600 caracteres."
     }
+
 
     // Intentar llamar a la SDK oficial por reflexión para evitar dependencias estáticas en tiempo de compilación
     private fun tryCallSdk(prompt: String): Result<String> {
@@ -187,109 +169,183 @@ class GeminiClient {
     }
 
     private fun callRestGenerate(prompt: String): Result<String> {
-        // Construir el JSON según la especificación REST para generateContent/generate
-        val requestJson = JSONObject().apply {
-            put("contents", org.json.JSONArray().apply {
-                put(JSONObject().apply {
-                    put("parts", org.json.JSONArray().apply {
-                        put(JSONObject().apply {
-                            put("text", prompt)
+        val url = "https://generativelanguage.googleapis.com/v1/${modelName}:generateContent?key=$apiKey"
+
+        // Intentos de tokens: primer intento conservador, reintento si truncado
+        // Usamos más espacio en tokens en la primera pasada para asegurar salida larga si es necesario
+        // Aumentamos tokens permitidos para la salida para evitar truncamiento
+        val tokenAttempts = listOf(2048, 4096)
+
+        for (attempt in tokenAttempts.indices) {
+            val maxTokens = tokenAttempts[attempt]
+
+            val requestJson = JSONObject().apply {
+                put("contents", org.json.JSONArray().apply {
+                    put(JSONObject().apply {
+                        put("parts", org.json.JSONArray().apply {
+                            put(JSONObject().apply {
+                                put("text", prompt)
+                            })
                         })
                     })
                 })
-            })
-            put("generationConfig", JSONObject().apply {
-                put("temperature", 0.7)
-                put("maxOutputTokens", 512)
-            })
-        }.toString()
+                put("generationConfig", JSONObject().apply {
+                    // temperatura baja para respuestas más concretas
+                    put("temperature", 0.0)
+                    put("maxOutputTokens", maxTokens)
+                })
+            }.toString()
 
-        // Log request body completo
-        Log.d("ERROR_INTERPRETACION", "HTTP Request JSON: $requestJson")
+            Log.d("ERROR_INTERPRETACION", "HTTP Request JSON (attempt=${attempt + 1}, maxOutputTokens=$maxTokens): $requestJson")
 
-        val url = "https://generativelanguage.googleapis.com/v1/${modelName}:generateContent?key=$apiKey"
-        val req = Request.Builder()
-            .url(url)
-            .post(requestJson.toRequestBody(contentType))
-            .build()
+            val req = Request.Builder()
+                .url(url)
+                .post(requestJson.toRequestBody(contentType))
+                .build()
 
-        try {
-            httpClient.newCall(req).execute().use { resp ->
-                val bodyText = resp.body?.string() ?: ""
+            try {
+                // Manejo especial para 503/429 (modelo ocupado / rate limit)
+                var resp = httpClient.newCall(req).execute()
+                var attempt503 = 0
+                val max503Retries = 4
+                var bodyText = ""
+                var code = resp.code
+                while ((code == 503 || code == 429) && attempt503 < max503Retries) {
+                    bodyText = resp.body?.string() ?: ""
+                    Log.w("ERROR_INTERPRETACION", "HTTP $code received (attempt503=${attempt503 + 1}). Retrying after backoff. Body: $bodyText")
+                    try { resp.close() } catch (_: Throwable) {}
+                    // backoff exponencial con jitter (ms)
+                    val base = 1000L * (1L shl attempt503)
+                    val jitter = Random.nextLong(0, 500)
+                    val sleepMs = base + jitter
+                    Thread.sleep(sleepMs)
+                    attempt503++
+                    // reintentar
+                    resp = httpClient.newCall(req).execute()
+                    code = resp.code
+                }
+
+                bodyText = resp.body?.string() ?: ""
+                code = resp.code
+                if ((code == 503 || code == 429) && attempt503 >= max503Retries) {
+                    Log.e("ERROR_INTERPRETACION", "HTTP $code after $attempt503 retries: $bodyText")
+                    try { resp.close() } catch (_: Throwable) {}
+                    // En vez de fallar de forma definitiva, pasamos al siguiente intento de tokens
+                    Log.w("ERROR_INTERPRETACION", "Model overloaded after retries, intentaremos con el siguiente tamaño de token (si existe) o fallback local.")
+                    try { resp.close() } catch (_: Throwable) {}
+                    // continuar al siguiente token attempt
+                    continue
+                }
+
+                // No es 503/429 -> proceder
                 if (!resp.isSuccessful) {
                     Log.e("ERROR_INTERPRETACION", "HTTP ${resp.code}: $bodyText")
+                    try { resp.close() } catch (_: Throwable) {}
                     return Result.failure(IOException("HTTP ${resp.code}: $bodyText"))
                 }
 
                 Log.d("ERROR_INTERPRETACION", "HTTP ${resp.code} successful. Response body: $bodyText")
 
-                // Extraer texto de la respuesta JSON según la forma esperada
+                // Parsear y extraer texto — en un bloque limpio
                 try {
                     val j = JSONObject(bodyText)
-                    // La estructura puede variar; intentaremos extraer texto de varias formas comunes
-                    // 1) candidates -> [0] -> content -> parts -> [0] -> text
-                    if (j.has("candidates")) {
+                    var wasTruncated = false
+
+                    // registrar usageMetadata si existe
+                    if (j.has("usageMetadata")) {
+                        try {
+                            val usage = j.getJSONObject("usageMetadata")
+                            val promptTokens = usage.optInt("promptTokenCount", -1)
+                            val totalTokens = usage.optInt("totalTokenCount", -1)
+                            val thoughts = usage.optInt("thoughtsTokenCount", -1)
+                            Log.d("ERROR_INTERPRETACION", "usageMetadata: promptTokens=$promptTokens, thoughts=$thoughts, totalTokens=$totalTokens")
+                        } catch (_: Throwable) {}
+                    }
+
+                    // candidates
+                    val candidateText = if (j.has("candidates")) {
                         val candidates = j.getJSONArray("candidates")
                         if (candidates.length() > 0) {
                             val candidate = candidates.getJSONObject(0)
-                            // Extraer text flexible desde 'content' (puede ser JSONObject/JSONArray/string)
-                            val contentObj = candidate.opt("content")
-                            val extracted = extractTextFromContent(contentObj)
-                            if (extracted.isNotBlank()) {
-                                // Log de texto extraído (por seguridad truncamos a 1000 chars en log)
-                                val preview = if (extracted.length > 1000) extracted.substring(0, 1000) + "..." else extracted
-                                Log.d("ERROR_INTERPRETACION", "Extracted text length=${extracted.length}. Preview: $preview")
-                                // Si la generación fue truncada por tokens, avisar
-                                val finishReason = candidate.optString("finishReason", candidate.optString("finish_reason", ""))
-                                if (finishReason.equals("MAX_TOKENS", ignoreCase = true)) {
-                                    Log.w("ERROR_INTERPRETACION", "Response truncated (finishReason=MAX_TOKENS). Consider increasing maxOutputTokens if needed.")
-                                }
-                                return Result.success(extracted)
-                            }
-                            // fallback: candidate might have 'output' field
-                            val out = candidate.optString("output", "")
-                            if (out.isNotBlank()) return Result.success(out)
+                            val finishReason = candidate.optString("finishReason", candidate.optString("finish_reason", ""))
+                            if (finishReason.equals("MAX_TOKENS", ignoreCase = true)) wasTruncated = true
+                            extractTextFromContent(candidate.opt("content"))
+                        } else ""
+                    } else ""
+
+                    if (candidateText.isNotBlank()) {
+                        var finalText = candidateText
+                        if (finalText.length > 300) finalText = finalText.substring(0, 300)
+                        if (wasTruncated && attempt < tokenAttempts.size - 1 && finalText.length < 300) {
+                            Log.w("ERROR_INTERPRETACION", "Response truncated (finishReason=MAX_TOKENS). Reintentando con más tokens...")
+                            Thread.sleep(200L)
+                            try { resp.close() } catch (_: Throwable) {}
+                            continue
                         }
+                        try { resp.close() } catch (_: Throwable) {}
+                        return Result.success(finalText)
                     }
 
-                    // 2) outputs -> [0] -> content -> parts -> [0] -> text
-                    if (j.has("outputs")) {
+                    // outputs
+                    val outputsText = if (j.has("outputs")) {
                         val outputs = j.getJSONArray("outputs")
                         if (outputs.length() > 0) {
                             val outObj = outputs.getJSONObject(0)
-                            val contentObj = outObj.opt("content")
-                            val extracted = extractTextFromContent(contentObj)
-                            if (extracted.isNotBlank()) {
-                                val preview = if (extracted.length > 1000) extracted.substring(0, 1000) + "..." else extracted
-                                Log.d("ERROR_INTERPRETACION", "Extracted text from outputs length=${extracted.length}. Preview: $preview")
-                                val finishReason = outObj.optString("finishReason", outObj.optString("finish_reason", ""))
-                                if (finishReason.equals("MAX_TOKENS", ignoreCase = true)) {
-                                    Log.w("ERROR_INTERPRETACION", "Outputs truncated (finishReason=MAX_TOKENS).")
-                                }
-                                return Result.success(extracted)
-                            }
+                            val finishReason = outObj.optString("finishReason", outObj.optString("finish_reason", ""))
+                            if (finishReason.equals("MAX_TOKENS", ignoreCase = true)) wasTruncated = true
+                            extractTextFromContent(outObj.opt("content"))
+                        } else ""
+                    } else ""
+
+                    if (outputsText.isNotBlank()) {
+                        var finalText = outputsText
+                        if (finalText.length > 300) finalText = finalText.substring(0, 300)
+                        if (wasTruncated && attempt < tokenAttempts.size - 1 && finalText.length < 300) {
+                            Log.w("ERROR_INTERPRETACION", "Outputs truncated (finishReason=MAX_TOKENS). Reintentando with more tokens...")
+                            Thread.sleep(200L)
+                            try { resp.close() } catch (_: Throwable) {}
+                            continue
+                        }
+                        try { resp.close() } catch (_: Throwable) {}
+                        return Result.success(finalText)
+                    }
+
+                    // top-level
+                    if (j.has("output")) {
+                        try { resp.close() } catch (_: Throwable) {}
+                        return Result.success(j.optString("output"))
+                    }
+
+                    if (j.has("content")) {
+                        val top = extractTextFromContent(j.opt("content"))
+                        if (top.isNotBlank()) {
+                            try { resp.close() } catch (_: Throwable) {}
+                            return Result.success(top)
                         }
                     }
 
-                    // 3) top-level fields
-                    if (j.has("output")) return Result.success(j.optString("output"))
-                    if (j.has("content")) {
-                        val contentObj = j.opt("content")
-                        val extracted = extractTextFromContent(contentObj)
-                        if (extracted.isNotBlank()) return Result.success(extracted)
+                    // Si llegamos aquí y fue truncado, reintentar con más tokens
+                    if (wasTruncated && attempt < tokenAttempts.size - 1) {
+                        Log.w("ERROR_INTERPRETACION", "Detected truncation but no extractable text; reintentando con más tokens...")
+                        Thread.sleep(200L)
+                        try { resp.close() } catch (_: Throwable) {}
+                        continue
                     }
 
-                    // Si no encontramos, devolver el JSON completo como fallback
+                    try { resp.close() } catch (_: Throwable) {}
                     return Result.success(bodyText)
-                } catch (je: Throwable) {
-                    Log.e("ERROR_INTERPRETACION", "Error parsing response JSON: ${je.message}")
+                } catch (eParse: Throwable) {
+                    Log.e("ERROR_INTERPRETACION", "Error parsing response JSON: ${eParse.message}")
+                    try { resp.close() } catch (_: Throwable) {}
                     return Result.success(bodyText)
                 }
+            } catch (e: Throwable) {
+                Log.e("ERROR_INTERPRETACION", "Exception during HTTP call: ${e.message}", e)
+                return Result.failure(e)
             }
-        } catch (e: Throwable) {
-            Log.e("ERROR_INTERPRETACION", "Exception during HTTP call: ${e.message}", e)
-            return Result.failure(e)
         }
+
+        return Result.failure(IOException("Failed to generate content after retries"))
     }
 
     // Extrae texto de un objeto 'content' flexible que puede ser JSONObject, JSONArray o String
@@ -350,6 +406,68 @@ class GeminiClient {
             appendLine("Consulta: $prompt")
             appendLine("Respuesta: Las cartas indican un camino de autodescubrimiento y crecimiento personal.")
             appendLine("Consejo: Confía en tu intuición y busca el equilibrio emocional.")
+        }
+    }
+
+    // Intenta expandir un texto hasta al menos `minChars` llamando al endpoint una vez.
+    private fun expandTextToLength(shortText: String, minChars: Int): String {
+        val expandPrompt = "Extiende el siguiente texto hasta al menos $minChars caracteres, manteniendo el mismo tono y sin añadir metadatos ni encabezados. Texto: \"$shortText\""
+        val url = "https://generativelanguage.googleapis.com/v1/${modelName}:generateContent?key=$apiKey"
+
+        val requestJson = JSONObject().apply {
+            put("contents", org.json.JSONArray().apply {
+                put(JSONObject().apply {
+                    put("parts", org.json.JSONArray().apply {
+                        put(JSONObject().apply { put("text", expandPrompt) })
+                    })
+                })
+            })
+            put("generationConfig", JSONObject().apply {
+                put("temperature", 0.0)
+                put("maxOutputTokens", 2048)
+            })
+        }.toString()
+
+        Log.d("ERROR_INTERPRETACION", "HTTP Expand Request JSON: $requestJson")
+
+        val req = Request.Builder().url(url).post(requestJson.toRequestBody(contentType)).build()
+        try {
+            httpClient.newCall(req).execute().use { resp ->
+                val bodyText = resp.body?.string() ?: ""
+                if (!resp.isSuccessful) {
+                    Log.w("ERROR_INTERPRETACION", "Expand HTTP ${resp.code}: $bodyText")
+                    return ""
+                }
+                try {
+                    val j = JSONObject(bodyText)
+                    // reuse extractor
+                    if (j.has("candidates")) {
+                        val candidates = j.getJSONArray("candidates")
+                        if (candidates.length() > 0) {
+                            val candidate = candidates.getJSONObject(0)
+                            val contentObj = candidate.opt("content")
+                            val extracted = extractTextFromContent(contentObj)
+                            return extracted
+                        }
+                    }
+                    if (j.has("outputs")) {
+                        val outputs = j.getJSONArray("outputs")
+                        if (outputs.length() > 0) {
+                            val outObj = outputs.getJSONObject(0)
+                            val contentObj = outObj.opt("content")
+                            val extracted = extractTextFromContent(contentObj)
+                            return extracted
+                        }
+                    }
+                    return bodyText
+                } catch (e: Throwable) {
+                    Log.w("ERROR_INTERPRETACION", "Expand parse failed: ${e.message}")
+                    return bodyText
+                }
+            }
+        } catch (e: Throwable) {
+            Log.w("ERROR_INTERPRETACION", "Expand request exception: ${e.message}")
+            return ""
         }
     }
 }
